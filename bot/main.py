@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timedelta
 import os
 import sys
+import random
 
 # Add the bot directory to the Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +125,10 @@ message_log_channel = None
 # Global variable for member count channel
 member_count_channel = None
 
+# Global variables for leveling system
+levelup_channel = None
+user_cooldowns = {}  # Track XP gain cooldowns
+
 async def setup_message_logging_channel():
     """Set up the message logging channel"""
     global message_log_channel
@@ -237,6 +242,299 @@ async def update_member_count_channel():
     except Exception as e:
         logger.error(f"Error updating member count channel: {e}")
 
+async def setup_leveling_channel():
+    """Set up the Level category and level-up channel"""
+    global levelup_channel
+    
+    if not bot.guilds:
+        return
+        
+    guild = bot.guilds[0]  # Use first guild
+    
+    # Find or create Level category
+    level_category = discord.utils.get(guild.categories, name=LEVEL_CATEGORY)
+    if not level_category:
+        # Create Level category if it doesn't exist
+        level_category = await guild.create_category(
+            name=LEVEL_CATEGORY,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+    
+    # Find or create level-up channel
+    levelup_channel = discord.utils.get(guild.channels, name=LEVELUP_CHANNEL)
+    if not levelup_channel:
+        levelup_channel = await guild.create_text_channel(
+            name=LEVELUP_CHANNEL,
+            category=level_category,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+            }
+        )
+        
+        # Send welcome message to the channel
+        embed = discord.Embed(
+            title="🎉 Level Up Announcements",
+            description=f"This channel will announce when members level up in **{guild.name}**!",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="How it works", value="• Gain XP by sending messages\n• Level up when you reach XP thresholds\n• Get level roles automatically", inline=False)
+        embed.set_footer(text=f"Level system activated at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        
+        await levelup_channel.send(embed=embed)
+        
+    logger.info(f"Level-up channel set up: #{levelup_channel.name}")
+
+def calculate_level_from_xp(xp):
+    """Calculate level based on XP using dynamic formula"""
+    if xp < LEVEL_UP_BASE:
+        return 1
+    
+    level = 1
+    required_xp = LEVEL_UP_BASE
+    
+    while xp >= required_xp:
+        level += 1
+        required_xp = int(LEVEL_UP_BASE * (level ** LEVEL_UP_MULTIPLIER))
+    
+    return level - 1
+
+def calculate_xp_for_level(level):
+    """Calculate required XP for a specific level"""
+    if level <= 1:
+        return 0
+    
+    total_xp = 0
+    for i in range(2, level + 1):
+        total_xp += int(LEVEL_UP_BASE * (i ** LEVEL_UP_MULTIPLIER))
+    
+    return total_xp
+
+def calculate_xp_to_next_level(current_xp, current_level):
+    """Calculate XP needed to reach next level"""
+    next_level_xp = calculate_xp_for_level(current_level + 1)
+    return max(0, next_level_xp - current_xp)
+
+def calculate_level_color(level):
+    """Calculate progressively darker red color for level roles"""
+    # Start with a light red and make it darker as level increases
+    # Base red color: #FF4444 (bright red)
+    # Target dark red: #800000 (dark red)
+    
+    # Clamp level to reasonable range for color calculation
+    level = min(level, MAX_LEVEL_ROLES)
+    
+    # Calculate darkness factor (0.0 to 1.0)
+    # Level 1 = lightest, higher levels = darker
+    darkness_factor = min((level - 1) / 50.0, 1.0)  # Spread over 50 levels
+    
+    # RGB values for red progression
+    # Start: #FF4444 (255, 68, 68)
+    # End:   #800000 (128, 0, 0)
+    start_r, start_g, start_b = 255, 68, 68
+    end_r, end_g, end_b = 128, 0, 0
+    
+    # Interpolate between start and end colors
+    r = int(start_r - (start_r - end_r) * darkness_factor)
+    g = int(start_g - (start_g - end_g) * darkness_factor)
+    b = int(start_b - (start_b - end_b) * darkness_factor)
+    
+    # Convert to hex color
+    color_hex = (r << 16) | (g << 8) | b
+    return color_hex
+
+def calculate_message_length_xp(message_content):
+    """Calculate bonus XP based on message length"""
+    if not message_content:
+        return 0
+    
+    message_length = len(message_content.strip())
+    
+    # Don't give XP for very short messages
+    if message_length < MIN_MESSAGE_LENGTH:
+        return 0
+    
+    # Calculate length bonus
+    length_bonus = int(message_length * MESSAGE_LENGTH_MULTIPLIER)
+    
+    # Cap the bonus to prevent abuse
+    length_bonus = min(length_bonus, MAX_LENGTH_BONUS)
+    
+    return length_bonus
+
+async def get_or_create_level_role(guild, level):
+    """Get or create a level role for the specified level"""
+    if not ENABLE_LEVEL_ROLES or level > MAX_LEVEL_ROLES:
+        return None
+    
+    # Calculate XP requirement for this level
+    level_xp = calculate_xp_for_level(level)
+    role_name = f"{LEVEL_ROLE_PREFIX} {level} (XP {level_xp:,})"
+    
+    # First try to find role with new format
+    role = discord.utils.get(guild.roles, name=role_name)
+    
+    # If not found, try old format for backward compatibility
+    if not role:
+        old_role_name = f"{LEVEL_ROLE_PREFIX} {level}"
+        old_role = discord.utils.get(guild.roles, name=old_role_name)
+        
+        if old_role:
+            # Update old role to new format
+            try:
+                await old_role.edit(name=role_name, reason="Updated role name to include XP requirement")
+                role = old_role
+                logger.info(f"Updated role name from '{old_role_name}' to '{role_name}'")
+            except Exception as e:
+                logger.error(f"Failed to update role name for {old_role_name}: {e}")
+                role = old_role  # Use old role if rename fails
+    
+    # Create new role if it doesn't exist
+    if not role:
+        try:
+            # Calculate the red shade for this level
+            level_color = calculate_level_color(level)
+            
+            # Create the role with the calculated red shade
+            role = await guild.create_role(
+                name=role_name,
+                color=discord.Color(level_color),
+                reason=f"Auto-created level role for level {level}"
+            )
+            logger.info(f"Created new level role: {role_name} with color #{level_color:06x}")
+        except Exception as e:
+            logger.error(f"Failed to create level role {role_name}: {e}")
+            return None
+    
+    return role
+
+async def update_user_level_role(member, old_level, new_level):
+    """Update user's level role (remove old, add new)"""
+    if not ENABLE_LEVEL_ROLES:
+        return
+    
+    try:
+        guild = member.guild
+        
+        # Remove old level role if it exists
+        if old_level and old_level != new_level:
+            # Try new format first
+            old_level_xp = calculate_xp_for_level(old_level)
+            new_format_name = f"{LEVEL_ROLE_PREFIX} {old_level} (XP {old_level_xp:,})"
+            old_role = discord.utils.get(guild.roles, name=new_format_name)
+            
+            # If not found, try old format
+            if not old_role:
+                old_format_name = f"{LEVEL_ROLE_PREFIX} {old_level}"
+                old_role = discord.utils.get(guild.roles, name=old_format_name)
+            
+            if old_role and old_role in member.roles:
+                await member.remove_roles(old_role, reason=f"Level up from {old_level} to {new_level}")
+                logger.debug(f"Removed {old_role.name} from {member}")
+        
+        # Add new level role
+        new_role = await get_or_create_level_role(guild, new_level)
+        if new_role and new_role not in member.roles:
+            await member.add_roles(new_role, reason=f"Level up to {new_level}")
+            logger.debug(f"Added {new_role.name} to {member}")
+            
+    except Exception as e:
+        logger.error(f"Error updating level role for {member}: {e}")
+
+async def announce_level_up(member, old_level, new_level, new_xp):
+    """Announce level up in the level-up channel"""
+    global levelup_channel
+    
+    if not levelup_channel:
+        return
+    
+    try:
+        # Create level up embed
+        embed = discord.Embed(
+            title="🎉 Level Up!",
+            description=f"{member.mention} has reached **Level {new_level}**!",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.avatar.url if member.avatar else member.default_avatar.url
+        )
+        
+        embed.add_field(name="Previous Level", value=str(old_level), inline=True)
+        embed.add_field(name="New Level", value=str(new_level), inline=True)
+        embed.add_field(name="Total XP", value=f"{new_xp:,}", inline=True)
+        
+        # Calculate XP to next level
+        xp_to_next = calculate_xp_to_next_level(new_xp, new_level)
+        if xp_to_next > 0:
+            embed.add_field(name="XP to Next Level", value=f"{xp_to_next:,}", inline=True)
+        
+        embed.set_footer(text=f"Keep chatting to earn more XP!")
+        
+        await levelup_channel.send(embed=embed)
+        logger.info(f"Announced level up for {member} (Level {old_level} → {new_level})")
+        
+    except Exception as e:
+        logger.error(f"Error announcing level up for {member}: {e}")
+
+async def process_xp_gain(message):
+    """Process XP gain for a message"""
+    global user_cooldowns
+    
+    # Skip bots
+    if message.author.bot:
+        return
+    
+    user_id = message.author.id
+    guild_id = message.guild.id
+    current_time = datetime.utcnow()
+    
+    # Check cooldown
+    cooldown_key = f"{user_id}_{guild_id}"
+    if cooldown_key in user_cooldowns:
+        time_diff = (current_time - user_cooldowns[cooldown_key]).total_seconds()
+        if time_diff < XP_COOLDOWN:
+            return  # Still in cooldown
+    
+    try:
+        # Get current user data
+        user_data = db.get_user_xp(user_id, guild_id)
+        current_xp = user_data['xp']
+        current_level = user_data['level']
+        
+        # Calculate XP gain (base + random bonus + message length bonus)
+        base_xp = XP_PER_MESSAGE
+        bonus_xp = random.randint(XP_BONUS_MIN, XP_BONUS_MAX)
+        length_xp = calculate_message_length_xp(message.content)
+        xp_gained = base_xp + bonus_xp + length_xp
+        
+        new_xp = current_xp + xp_gained
+        new_level = calculate_level_from_xp(new_xp)
+        
+        # Update cooldown
+        user_cooldowns[cooldown_key] = current_time
+        
+        # Update database
+        db.update_user_xp(user_id, guild_id, xp_gained, new_level if new_level != current_level else None)
+        
+        # Check for level up
+        if new_level > current_level:
+            # Update role
+            await update_user_level_role(message.author, current_level, new_level)
+            
+            # Announce level up
+            await announce_level_up(message.author, current_level, new_level, new_xp)
+            
+            logger.info(f"{message.author} leveled up from {current_level} to {new_level} (XP: {new_xp})")
+        
+    except Exception as e:
+        logger.error(f"Error processing XP gain for {message.author}: {e}")
+
 async def log_user_message(message):
     """Log user message to the message logging channel"""
     global message_log_channel
@@ -314,6 +612,9 @@ async def on_ready():
     # Set up member count channel
     await setup_member_count_channel()
     
+    # Set up leveling system
+    await setup_leveling_channel()
+    
     # Set bot status
     activity = discord.Activity(type=discord.ActivityType.watching, name="the server | !help")
     await bot.change_presence(activity=activity)
@@ -390,6 +691,9 @@ async def on_message(message):
     
     # Log all user messages to dedicated channel
     await log_user_message(message)
+    
+    # Process XP gain for leveling system
+    await process_xp_gain(message)
     
     # Update user activity
     try:
@@ -523,9 +827,16 @@ async def send_help_message(channel, user=None):
     if user_is_admin:
         embed.add_field(
             name="🛡️ Admin Commands",
-            value="`!kick <user> [reason]` - Kick a member\n`!ban <user> [reason]` - Ban a member\n`!unban <user_id>` - Unban a member\n`!mute <user> [time] [reason]` - Mute a member\n`!unmute <user>` - Unmute a member\n`!purge <amount>` - Delete messages\n`!syncusers` - Sync all server members to database\n`!testlog` - Test Discord logging\n`!testmessagelog` - Test message logging",
+            value="`!kick <user> [reason]` - Kick a member\n`!ban <user> [reason]` - Ban a member\n`!unban <user_id>` - Unban a member\n`!mute <user> [time] [reason]` - Mute a member\n`!unmute <user>` - Unmute a member\n`!purge <amount>` - Delete messages\n`!syncusers` - Sync all server members to database\n`!resetlevel <user>` - Reset user's level and XP\n`!setlevel <user> <level>` - Set user's level\n`!addxp <user> <amount>` - Add/remove XP points\n`!synclevelroles` - Sync level roles for users without them\n`!updateroles` - Update role names to include XP\n`!levelstats` - Show leveling system statistics\n`!testlog` - Test Discord logging\n`!testmessagelog` - Test message logging",
             inline=False
         )
+    
+    # Leveling Commands
+    embed.add_field(
+        name="📈 Leveling System",
+        value="`!level [user]` - Check level and XP\n`!leaderboard [limit]` - Show server leaderboard\n`!rank [user]` - Alias for !level",
+        inline=False
+    )
     
     # Dev Commands
     embed.add_field(
@@ -1176,6 +1487,641 @@ async def extract_user_data(member):
             'accent_color': None,
             'activity': None
         }
+
+# Leveling System Commands
+@bot.command(name='level', aliases=['rank'])
+async def check_level(ctx, member: discord.Member = None):
+    """Check your or someone else's level and XP"""
+    target = member or ctx.author
+    
+    try:
+        user_data = db.get_user_xp(target.id, ctx.guild.id)
+        current_xp = user_data['xp']
+        current_level = user_data['level']
+        messages_count = user_data['messages_count']
+        
+        # Calculate XP for current and next level
+        current_level_xp = calculate_xp_for_level(current_level)
+        next_level_xp = calculate_xp_for_level(current_level + 1)
+        xp_to_next = next_level_xp - current_xp
+        xp_progress = current_xp - current_level_xp
+        xp_needed = next_level_xp - current_level_xp
+        
+        # Get user's rank
+        rank = db.get_user_rank(target.id, ctx.guild.id)
+        
+        embed = discord.Embed(
+            title=f"📊 Level Statistics",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_author(
+            name=target.display_name,
+            icon_url=target.avatar.url if target.avatar else target.default_avatar.url
+        )
+        
+        embed.add_field(name="Level", value=f"**{current_level}**", inline=True)
+        embed.add_field(name="Rank", value=f"**#{rank}**" if rank else "Unranked", inline=True)
+        embed.add_field(name="Total XP", value=f"{current_xp:,}", inline=True)
+        
+        embed.add_field(name="Messages Sent", value=f"{messages_count:,}", inline=True)
+        embed.add_field(name="XP to Next Level", value=f"{xp_to_next:,}", inline=True)
+        
+        # Progress bar
+        if xp_needed > 0:
+            progress_percent = int((xp_progress / xp_needed) * 100)
+            progress_bar = "█" * (progress_percent // 10) + "░" * (10 - (progress_percent // 10))
+            embed.add_field(name="Progress to Next Level", value=f"`{progress_bar}` {progress_percent}%", inline=False)
+        
+        embed.set_footer(text=f"Keep chatting to earn more XP!")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error checking level for {target}: {e}")
+        await ctx.send("An error occurred while checking level information.")
+
+@bot.command(name='leaderboard', aliases=['lb', 'top'])
+async def leaderboard(ctx, limit: int = 10):
+    """Show the server leaderboard"""
+    try:
+        if limit < 1 or limit > 20:
+            limit = 10
+        
+        leaderboard_data = db.get_leaderboard(ctx.guild.id, limit)
+        
+        if not leaderboard_data:
+            await ctx.send("No users found in the leaderboard.")
+            return
+        
+        embed = discord.Embed(
+            title="🏆 Server Leaderboard",
+            description=f"Top {len(leaderboard_data)} members by XP",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        leaderboard_text = ""
+        for i, user_data in enumerate(leaderboard_data, 1):
+            try:
+                user = ctx.guild.get_member(user_data['user_id'])
+                username = user.display_name if user else f"User {user_data['user_id']}"
+                
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                leaderboard_text += f"{medal} **{username}** - Level {user_data['level']} ({user_data['xp']:,} XP)\n"
+                
+            except Exception as e:
+                logger.error(f"Error processing leaderboard entry {i}: {e}")
+                continue
+        
+        embed.description = leaderboard_text
+        embed.set_footer(text=f"Guild: {ctx.guild.name}")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error showing leaderboard: {e}")
+        await ctx.send("An error occurred while fetching the leaderboard.")
+
+@bot.command(name='resetlevel')
+@is_admin()
+async def reset_user_level(ctx, member: discord.Member):
+    """Reset a user's level and XP (Admin only)"""
+    try:
+        # Reset in database
+        db.reset_user_xp(member.id, ctx.guild.id)
+        
+        # Remove all level roles (both old and new formats)
+        if ENABLE_LEVEL_ROLES:
+            level_roles = [
+                role for role in member.roles 
+                if role.name.startswith(LEVEL_ROLE_PREFIX) and (
+                    role.name.startswith(f"{LEVEL_ROLE_PREFIX} ") and 
+                    (role.name.count(" ") == 1 or "(XP " in role.name)
+                )
+            ]
+            if level_roles:
+                await member.remove_roles(*level_roles, reason=f"Level reset by {ctx.author}")
+            
+            # Add Level 1 role
+            level_1_role = await get_or_create_level_role(ctx.guild, 1)
+            if level_1_role and level_1_role not in member.roles:
+                await member.add_roles(level_1_role, reason=f"Level reset by {ctx.author}")
+        
+        # Log the action
+        db.log_admin_action(
+            admin_id=ctx.author.id,
+            admin_username=str(ctx.author),
+            action='resetlevel',
+            target_id=member.id,
+            target_username=str(member),
+            guild_id=ctx.guild.id
+        )
+        
+        embed = discord.Embed(
+            title="✅ Level Reset",
+            description=f"**{member.display_name}**'s level and XP have been reset to Level 1.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        logger.info(f"{ctx.author} reset level for {member}")
+        
+    except Exception as e:
+        logger.error(f"Error resetting level for {member}: {e}")
+        await ctx.send("An error occurred while resetting the user's level.")
+
+@bot.command(name='setlevel')
+@is_admin()
+async def set_user_level(ctx, member: discord.Member, level: int):
+    """Set a user's level to a specific value (Admin only)"""
+    try:
+        # Validate level
+        if level < 1:
+            await ctx.send("❌ Level must be at least 1.")
+            return
+        
+        if level > MAX_LEVEL_ROLES:
+            await ctx.send(f"❌ Level cannot exceed {MAX_LEVEL_ROLES}.")
+            return
+        
+        # Get current user data
+        current_data = db.get_user_xp(member.id, ctx.guild.id)
+        old_level = current_data['level']
+        
+        if level == old_level:
+            await ctx.send(f"**{member.display_name}** is already at Level {level}.")
+            return
+        
+        # Calculate required XP for the target level
+        required_xp = calculate_xp_for_level(level)
+        
+        # Update database with new level and XP
+        db.update_user_xp(
+            user_id=member.id,
+            guild_id=ctx.guild.id,
+            xp_gained=required_xp - current_data['xp'],  # Adjust XP to match level
+            new_level=level
+        )
+        
+        # Update level roles
+        if ENABLE_LEVEL_ROLES:
+            # Remove old level role (try both formats)
+            if old_level:
+                # Try new format first
+                old_level_xp = calculate_xp_for_level(old_level)
+                new_format_name = f"{LEVEL_ROLE_PREFIX} {old_level} (XP {old_level_xp:,})"
+                old_role = discord.utils.get(ctx.guild.roles, name=new_format_name)
+                
+                # If not found, try old format
+                if not old_role:
+                    old_format_name = f"{LEVEL_ROLE_PREFIX} {old_level}"
+                    old_role = discord.utils.get(ctx.guild.roles, name=old_format_name)
+                
+                if old_role and old_role in member.roles:
+                    await member.remove_roles(old_role, reason=f"Level changed by {ctx.author}")
+            
+            # Add new level role
+            new_role = await get_or_create_level_role(ctx.guild, level)
+            if new_role and new_role not in member.roles:
+                await member.add_roles(new_role, reason=f"Level set to {level} by {ctx.author}")
+        
+        # Log the action
+        db.log_admin_action(
+            admin_id=ctx.author.id,
+            admin_username=str(ctx.author),
+            action='setlevel',
+            target_id=member.id,
+            target_username=str(member),
+            reason=f"Level changed from {old_level} to {level}",
+            guild_id=ctx.guild.id
+        )
+        
+        # Create response embed
+        embed = discord.Embed(
+            title="✅ Level Updated",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.avatar.url if member.avatar else member.default_avatar.url
+        )
+        
+        embed.add_field(name="Previous Level", value=str(old_level), inline=True)
+        embed.add_field(name="New Level", value=str(level), inline=True)
+        embed.add_field(name="New XP", value=f"{required_xp:,}", inline=True)
+        
+        # Calculate XP to next level
+        if level < MAX_LEVEL_ROLES:
+            xp_to_next = calculate_xp_to_next_level(required_xp, level)
+            embed.add_field(name="XP to Next Level", value=f"{xp_to_next:,}", inline=True)
+        
+        embed.set_footer(text=f"Level set by {ctx.author.display_name}")
+        
+        await ctx.send(embed=embed)
+        
+        # Announce level change in level-up channel if it's an upgrade
+        if level > old_level:
+            await announce_level_up(member, old_level, level, required_xp)
+        
+        logger.info(f"{ctx.author} set {member}'s level from {old_level} to {level}")
+        
+    except ValueError:
+        await ctx.send("❌ Please provide a valid level number.")
+    except Exception as e:
+        logger.error(f"Error setting level for {member}: {e}")
+        await ctx.send("An error occurred while setting the user's level.")
+
+@bot.command(name='addxp')
+@is_admin()
+async def add_user_xp(ctx, member: discord.Member, xp_amount: int):
+    """Add XP points to a specific user (Admin only)"""
+    try:
+        # Validate XP amount
+        if xp_amount == 0:
+            await ctx.send("❌ XP amount cannot be zero.")
+            return
+        
+        if abs(xp_amount) > 10000:
+            await ctx.send("❌ XP amount cannot exceed ±10,000 at once.")
+            return
+        
+        # Get current user data
+        current_data = db.get_user_xp(member.id, ctx.guild.id)
+        old_xp = current_data['xp']
+        old_level = current_data['level']
+        
+        # Calculate new XP (don't let it go below 0)
+        new_xp = max(0, old_xp + xp_amount)
+        new_level = calculate_level_from_xp(new_xp)
+        
+        # Update database
+        db.update_user_xp(
+            user_id=member.id,
+            guild_id=ctx.guild.id,
+            xp_gained=new_xp - old_xp,  # Actual XP change (might be different if capped at 0)
+            new_level=new_level if new_level != old_level else None
+        )
+        
+        # Handle level changes
+        level_changed = new_level != old_level
+        if level_changed and ENABLE_LEVEL_ROLES:
+            await update_user_level_role(member, old_level, new_level)
+        
+        # Log the action
+        action_type = 'addxp' if xp_amount > 0 else 'removexp'
+        db.log_admin_action(
+            admin_id=ctx.author.id,
+            admin_username=str(ctx.author),
+            action=action_type,
+            target_id=member.id,
+            target_username=str(member),
+            reason=f"{'Added' if xp_amount > 0 else 'Removed'} {abs(xp_amount)} XP",
+            guild_id=ctx.guild.id
+        )
+        
+        # Create response embed
+        embed = discord.Embed(
+            title="✅ XP Updated",
+            color=discord.Color.green() if xp_amount > 0 else discord.Color.orange(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.avatar.url if member.avatar else member.default_avatar.url
+        )
+        
+        # Show XP change
+        xp_change_text = f"+{xp_amount:,}" if xp_amount > 0 else f"{xp_amount:,}"
+        embed.add_field(name="XP Change", value=xp_change_text, inline=True)
+        embed.add_field(name="Previous XP", value=f"{old_xp:,}", inline=True)
+        embed.add_field(name="New XP", value=f"{new_xp:,}", inline=True)
+        
+        # Show level information
+        if level_changed:
+            embed.add_field(name="Previous Level", value=str(old_level), inline=True)
+            embed.add_field(name="New Level", value=str(new_level), inline=True)
+            
+            # Add level change indicator
+            if new_level > old_level:
+                embed.add_field(name="Level Change", value="📈 Level Up!", inline=True)
+            else:
+                embed.add_field(name="Level Change", value="📉 Level Down", inline=True)
+        else:
+            embed.add_field(name="Current Level", value=str(new_level), inline=True)
+            
+            # Show XP to next level
+            if new_level < MAX_LEVEL_ROLES:
+                xp_to_next = calculate_xp_to_next_level(new_xp, new_level)
+                embed.add_field(name="XP to Next Level", value=f"{xp_to_next:,}", inline=True)
+        
+        embed.set_footer(text=f"XP adjusted by {ctx.author.display_name}")
+        
+        await ctx.send(embed=embed)
+        
+        # Announce level up if applicable
+        if level_changed and new_level > old_level:
+            await announce_level_up(member, old_level, new_level, new_xp)
+        
+        action_word = "added" if xp_amount > 0 else "removed"
+        logger.info(f"{ctx.author} {action_word} {abs(xp_amount)} XP to {member} (Level {old_level}→{new_level})")
+        
+    except ValueError:
+        await ctx.send("❌ Please provide a valid XP amount (number).")
+    except Exception as e:
+        logger.error(f"Error adding XP to {member}: {e}")
+        await ctx.send("An error occurred while updating the user's XP.")
+
+@bot.command(name='updateroles')
+@is_admin()
+async def update_role_names(ctx):
+    """Update all level role names to include XP requirements (Admin only)"""
+    try:
+        # Send initial message
+        embed = discord.Embed(
+            title="🔄 Updating Role Names",
+            description="Starting role name update process...",
+            color=discord.Color.blue()
+        )
+        status_msg = await ctx.send(embed=embed)
+        
+        guild = ctx.guild
+        
+        # Find all old format level roles
+        old_roles = []
+        for role in guild.roles:
+            if (role.name.startswith(f"{LEVEL_ROLE_PREFIX} ") and 
+                role.name.count(" ") == 1 and 
+                "(XP " not in role.name):
+                
+                # Extract level number
+                try:
+                    level_str = role.name.replace(f"{LEVEL_ROLE_PREFIX} ", "")
+                    level = int(level_str)
+                    old_roles.append((role, level))
+                except ValueError:
+                    continue
+        
+        total_roles = len(old_roles)
+        
+        # Update status
+        embed = discord.Embed(
+            title="🔄 Updating Role Names",
+            description=f"Found **{total_roles}** roles to update.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Status", value="Updating role names...", inline=False)
+        await status_msg.edit(embed=embed)
+        
+        if total_roles == 0:
+            embed = discord.Embed(
+                title="✅ Update Complete",
+                description="All role names are already up to date!",
+                color=discord.Color.green()
+            )
+            await status_msg.edit(embed=embed)
+            return
+        
+        # Update roles
+        updated_count = 0
+        errors = 0
+        
+        for i, (role, level) in enumerate(old_roles):
+            try:
+                # Calculate new name
+                level_xp = calculate_xp_for_level(level)
+                new_name = f"{LEVEL_ROLE_PREFIX} {level} (XP {level_xp:,})"
+                
+                # Update role name
+                await role.edit(name=new_name, reason="Updated role name to include XP requirement")
+                updated_count += 1
+                logger.info(f"Updated role name: {role.name} → {new_name}")
+                
+                # Update status every 5 roles
+                if (i + 1) % 5 == 0 or i == len(old_roles) - 1:
+                    progress_percent = int(((i + 1) / len(old_roles)) * 100)
+                    embed.description = f"Found **{total_roles}** roles to update."
+                    embed.set_field_at(0, name="Status", value=f"Updating role names... {progress_percent}% ({i + 1}/{len(old_roles)})", inline=False)
+                    await status_msg.edit(embed=embed)
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error updating role {role.name}: {e}")
+                errors += 1
+        
+        # Final status
+        embed = discord.Embed(
+            title="✅ Role Names Updated",
+            description=f"Role name update completed successfully!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Total Roles Found", value=str(total_roles), inline=True)
+        embed.add_field(name="Successfully Updated", value=str(updated_count), inline=True)
+        
+        if errors > 0:
+            embed.add_field(name="Errors", value=str(errors), inline=True)
+            embed.color = discord.Color.orange()
+        
+        embed.set_footer(text=f"Update completed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        await status_msg.edit(embed=embed)
+        
+        # Log the action
+        db.log_admin_action(
+            admin_id=ctx.author.id,
+            admin_username=str(ctx.author),
+            action='updateroles',
+            reason=f"Updated {updated_count} role names to include XP requirements",
+            guild_id=guild.id
+        )
+        
+        logger.info(f"{ctx.author} updated {updated_count} role names (errors: {errors})")
+        
+    except Exception as e:
+        logger.error(f"Error in update_role_names command: {e}")
+        embed = discord.Embed(
+            title="❌ Update Failed",
+            description="An error occurred during role name update.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+
+@bot.command(name='levelstats')
+@is_admin()
+async def level_stats(ctx):
+    """Show leveling system statistics (Admin only)"""
+    try:
+        stats = db.get_level_stats(ctx.guild.id)
+        
+        if not stats:
+            await ctx.send("No leveling statistics available.")
+            return
+        
+        embed = discord.Embed(
+            title="📈 Leveling System Statistics",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="Total Users", value=f"{stats['total_users']:,}", inline=True)
+        embed.add_field(name="Total XP Earned", value=f"{stats['total_xp']:,}", inline=True)
+        embed.add_field(name="Total Messages", value=f"{stats['total_messages']:,}", inline=True)
+        embed.add_field(name="Average Level", value=f"{stats['avg_level']:.1f}", inline=True)
+        embed.add_field(name="Highest Level", value=f"{stats['max_level']}", inline=True)
+        
+        # System configuration
+        config_text = f"""
+        **XP per Message:** {XP_PER_MESSAGE} + {XP_BONUS_MIN}-{XP_BONUS_MAX} bonus
+        **Message Length Bonus:** {MESSAGE_LENGTH_MULTIPLIER}x per char (max {MAX_LENGTH_BONUS})
+        **Min Message Length:** {MIN_MESSAGE_LENGTH} characters
+        **Cooldown:** {XP_COOLDOWN}s
+        **Level Formula:** Base {LEVEL_UP_BASE} × Level^{LEVEL_UP_MULTIPLIER}
+        **Level Roles:** {'Enabled (Red Gradient)' if ENABLE_LEVEL_ROLES else 'Disabled'}
+        """
+        embed.add_field(name="System Configuration", value=config_text, inline=False)
+        
+        embed.set_footer(text=f"Guild: {ctx.guild.name}")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error showing level stats: {e}")
+        await ctx.send("An error occurred while fetching leveling statistics.")
+
+@bot.command(name='synclevelroles')
+@is_admin()
+async def sync_level_roles(ctx):
+    """Sync level roles for users who don't have them (Admin only)"""
+    try:
+        if not ENABLE_LEVEL_ROLES:
+            await ctx.send("❌ Level roles are disabled in the configuration.")
+            return
+        
+        # Send initial message
+        embed = discord.Embed(
+            title="🔄 Syncing Level Roles",
+            description="Starting level role synchronization process...",
+            color=discord.Color.blue()
+        )
+        status_msg = await ctx.send(embed=embed)
+        
+        guild = ctx.guild
+        
+        # Get all members and their level data
+        all_members = guild.members
+        members_without_roles = []
+        total_members = len(all_members)
+        
+        # Check each member for level roles
+        for member in all_members:
+            if member.bot:
+                continue  # Skip bots
+            
+            # Check if member has any level role (both old and new formats)
+            has_level_role = any(
+                role.name.startswith(LEVEL_ROLE_PREFIX) and (
+                    role.name.startswith(f"{LEVEL_ROLE_PREFIX} ") and 
+                    (role.name.count(" ") == 1 or "(XP " in role.name)  # Old format has 1 space, new format has "(XP "
+                )
+                for role in member.roles
+            )
+            
+            if not has_level_role:
+                # Get their level from database
+                user_data = db.get_user_xp(member.id, guild.id)
+                if user_data:
+                    members_without_roles.append((member, user_data['level']))
+        
+        members_to_sync = len(members_without_roles)
+        
+        # Update status
+        embed = discord.Embed(
+            title="🔄 Syncing Level Roles",
+            description=f"Found **{members_to_sync}** members without level roles out of **{total_members}** total members.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Status", value="Processing members...", inline=False)
+        await status_msg.edit(embed=embed)
+        
+        if members_to_sync == 0:
+            embed = discord.Embed(
+                title="✅ Sync Complete",
+                description="All members already have appropriate level roles!",
+                color=discord.Color.green()
+            )
+            await status_msg.edit(embed=embed)
+            return
+        
+        # Process members
+        synced_count = 0
+        errors = 0
+        
+        for i, (member, level) in enumerate(members_without_roles):
+            try:
+                # Get or create the appropriate level role
+                level_role = await get_or_create_level_role(guild, level)
+                
+                if level_role and level_role not in member.roles:
+                    await member.add_roles(level_role, reason=f"Level role sync by {ctx.author}")
+                    synced_count += 1
+                    logger.debug(f"Added {level_role.name} to {member}")
+                
+                # Update status every 10 members or on last member
+                if (i + 1) % 10 == 0 or i == len(members_without_roles) - 1:
+                    progress_percent = int(((i + 1) / len(members_without_roles)) * 100)
+                    embed.description = f"Found **{members_to_sync}** members without level roles out of **{total_members}** total members."
+                    embed.set_field_at(0, name="Status", value=f"Processing members... {progress_percent}% ({i + 1}/{len(members_without_roles)})", inline=False)
+                    await status_msg.edit(embed=embed)
+                
+                # Small delay to avoid rate limits
+                if i % 5 == 0:
+                    await asyncio.sleep(0.2)
+                    
+            except Exception as e:
+                logger.error(f"Error syncing level role for {member} (Level {level}): {e}")
+                errors += 1
+        
+        # Final status
+        embed = discord.Embed(
+            title="✅ Level Role Sync Complete",
+            description=f"Level role synchronization completed successfully!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Total Members", value=str(total_members), inline=True)
+        embed.add_field(name="Members Needing Roles", value=str(members_to_sync), inline=True)
+        embed.add_field(name="Roles Assigned", value=str(synced_count), inline=True)
+        
+        if errors > 0:
+            embed.add_field(name="Errors", value=str(errors), inline=True)
+            embed.color = discord.Color.orange()
+        
+        embed.set_footer(text=f"Sync completed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        await status_msg.edit(embed=embed)
+        
+        # Log the action
+        db.log_admin_action(
+            admin_id=ctx.author.id,
+            admin_username=str(ctx.author),
+            action='synclevelroles',
+            reason=f"Synced level roles for {synced_count} members",
+            guild_id=guild.id
+        )
+        
+        logger.info(f"{ctx.author} synced level roles for {synced_count} members (errors: {errors})")
+        
+    except Exception as e:
+        logger.error(f"Error in sync_level_roles command: {e}")
+        embed = discord.Embed(
+            title="❌ Sync Failed",
+            description="An error occurred during level role synchronization.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
 
 def parse_time(time_str):
     """Parse time string to seconds"""

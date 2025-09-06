@@ -121,6 +121,9 @@ if ENABLE_DISCORD_LOGGING:
 # Global variable for message logging channel
 message_log_channel = None
 
+# Global variable for member count channel
+member_count_channel = None
+
 async def setup_message_logging_channel():
     """Set up the message logging channel"""
     global message_log_channel
@@ -155,6 +158,84 @@ async def setup_message_logging_channel():
         )
         
     logger.info(f"Message logging channel set up: #{message_log_channel.name}")
+
+async def setup_member_count_channel():
+    """Set up the member count channel in General category"""
+    global member_count_channel
+    
+    if not bot.guilds:
+        return
+        
+    guild = bot.guilds[0]  # Use first guild
+    
+    # Find or create General category
+    general_category = discord.utils.get(guild.categories, name=GENERAL_CATEGORY)
+    if not general_category:
+        # Create General category if it doesn't exist
+        general_category = await guild.create_category(
+            name=GENERAL_CATEGORY,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False, connect=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+    
+    # Find or create member count channel
+    member_count_channel = None
+    for channel in guild.channels:
+        if channel.name.startswith(MEMBER_COUNT_CHANNEL):
+            member_count_channel = channel
+            break
+    if not member_count_channel:
+        # Create the channel with initial member count
+        member_count = len(guild.members)
+        channel_name = f"{MEMBER_COUNT_CHANNEL}-{member_count}"
+        
+        member_count_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=general_category,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+        
+        # Send welcome message to the channel
+        embed = discord.Embed(
+            title="📊 Server Member Count",
+            description=f"This channel displays the current number of members in **{guild.name}**.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Current Members", value=f"**{member_count}** members", inline=False)
+        embed.add_field(name="Note", value="This channel is read-only and updates automatically when members join or leave.", inline=False)
+        embed.set_footer(text=f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        
+        await member_count_channel.send(embed=embed)
+    else:
+        # Update existing channel name if needed
+        await update_member_count_channel()
+        
+    logger.info(f"Member count channel set up: #{member_count_channel.name}")
+
+async def update_member_count_channel():
+    """Update the member count channel name with current member count"""
+    global member_count_channel
+    
+    if not member_count_channel or not bot.guilds:
+        return
+    
+    try:
+        guild = bot.guilds[0]
+        member_count = len(guild.members)
+        new_channel_name = f"{MEMBER_COUNT_CHANNEL}-{member_count}"
+        
+        # Only update if the name is different
+        if member_count_channel.name != new_channel_name:
+            await member_count_channel.edit(name=new_channel_name)
+            logger.info(f"Updated member count channel name to: {new_channel_name}")
+            
+    except Exception as e:
+        logger.error(f"Error updating member count channel: {e}")
 
 async def log_user_message(message):
     """Log user message to the message logging channel"""
@@ -230,6 +311,9 @@ async def on_ready():
     # Set up message logging channel
     await setup_message_logging_channel()
     
+    # Set up member count channel
+    await setup_member_count_channel()
+    
     # Set bot status
     activity = discord.Activity(type=discord.ActivityType.watching, name="the server | !help")
     await bot.change_presence(activity=activity)
@@ -280,8 +364,23 @@ async def on_member_join(member):
         
         logger.info(f"New member joined: {member} ({member.id})")
         
+        # Update member count channel
+        await update_member_count_channel()
+        
     except Exception as e:
         logger.error(f"Error in on_member_join: {e}")
+
+@bot.event
+async def on_member_remove(member):
+    """Handle member leaving"""
+    try:
+        logger.info(f"Member left: {member} ({member.id})")
+        
+        # Update member count channel
+        await update_member_count_channel()
+        
+    except Exception as e:
+        logger.error(f"Error in on_member_remove: {e}")
 
 @bot.event
 async def on_message(message):

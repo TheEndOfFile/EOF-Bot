@@ -665,6 +665,16 @@ async def on_member_join(member):
         
         logger.info(f"New member joined: {member} ({member.id})")
         
+        # Assign Level 1 role to new member
+        if ENABLE_LEVEL_ROLES:
+            try:
+                level_1_role = await get_or_create_level_role(member.guild, 1)
+                if level_1_role and level_1_role not in member.roles:
+                    await member.add_roles(level_1_role, reason="Auto-assigned Level 1 role to new member")
+                    logger.info(f"Assigned Level 1 role to new member: {member}")
+            except Exception as e:
+                logger.error(f"Error assigning Level 1 role to new member {member}: {e}")
+        
         # Update member count channel
         await update_member_count_channel()
         

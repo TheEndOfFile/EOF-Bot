@@ -5,6 +5,8 @@ import asyncio
 from datetime import datetime, timedelta
 import os
 import sys
+import random
+import math
 
 # Add the bot directory to the Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +126,9 @@ message_log_channel = None
 # Global variable for member count channel
 member_count_channel = None
 
+# Global variable for level-up channel
+levelup_channel = None
+
 async def setup_message_logging_channel():
     """Set up the message logging channel"""
     global message_log_channel
@@ -237,6 +242,167 @@ async def update_member_count_channel():
     except Exception as e:
         logger.error(f"Error updating member count channel: {e}")
 
+async def setup_levelup_channel():
+    """Set up the level-up channel in Level category"""
+    global levelup_channel
+    
+    if not bot.guilds:
+        return
+        
+    guild = bot.guilds[0]  # Use first guild
+    
+    # Find or create Level category
+    level_category = discord.utils.get(guild.categories, name=LEVEL_CATEGORY)
+    if not level_category:
+        # Create Level category if it doesn't exist
+        level_category = await guild.create_category(
+            name=LEVEL_CATEGORY,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+    
+    # Find or create level-up channel
+    levelup_channel = discord.utils.get(guild.channels, name=LEVELUP_CHANNEL)
+    if not levelup_channel:
+        levelup_channel = await guild.create_text_channel(
+            name=LEVELUP_CHANNEL,
+            category=level_category,
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+        
+        # Send welcome message to the channel
+        embed = discord.Embed(
+            title="🎉 Level Up Announcements",
+            description=f"Welcome to the level-up channel! This is where we celebrate members reaching new levels in **{guild.name}**.",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="How it works", value="• Gain XP by sending messages\n• Each level requires more XP than the last\n• Level-ups are announced here automatically", inline=False)
+        embed.add_field(name="Commands", value="• `!level` - Check your current level\n• `!leaderboard` - View server rankings\n• `!levelstats` - Server level statistics", inline=False)
+        embed.set_footer(text=f"Start chatting to begin your journey!")
+        
+        await levelup_channel.send(embed=embed)
+        
+    logger.info(f"Level-up channel set up: #{levelup_channel.name}")
+
+def calculate_level_from_xp(xp):
+    """Calculate level from XP using exponential formula"""
+    if xp < LEVEL_UP_BASE:
+        return 0
+    
+    # Formula: level = floor(log(xp/base) / log(multiplier)) + 1
+    level = math.floor(math.log(xp / LEVEL_UP_BASE) / math.log(LEVEL_UP_MULTIPLIER)) + 1
+    return max(0, level)
+
+def calculate_xp_for_level(level):
+    """Calculate XP required for a specific level"""
+    if level <= 0:
+        return 0
+    
+    # Formula: xp = base * (multiplier ^ (level - 1))
+    return math.ceil(LEVEL_UP_BASE * (LEVEL_UP_MULTIPLIER ** (level - 1)))
+
+def calculate_xp_for_next_level(current_xp):
+    """Calculate XP needed for next level"""
+    current_level = calculate_level_from_xp(current_xp)
+    next_level_xp = calculate_xp_for_level(current_level + 1)
+    return next_level_xp - current_xp
+
+async def process_xp_gain(message):
+    """Process XP gain for a user message"""
+    global levelup_channel
+    
+    if not message.guild or message.author.bot:
+        return
+    
+    try:
+        # Get user's current level data
+        user_data = db.get_user_level_data(message.author.id, message.guild.id)
+        
+        # Check XP cooldown
+        if user_data.get('last_xp_gain'):
+            time_since_last = datetime.utcnow() - user_data['last_xp_gain']
+            if time_since_last.total_seconds() < XP_COOLDOWN:
+                return  # Still in cooldown
+        
+        # Calculate XP gain (base + random bonus)
+        xp_bonus = random.randint(XP_BONUS_MIN, XP_BONUS_MAX)
+        xp_gained = XP_PER_MESSAGE + xp_bonus
+        
+        # Calculate old and new levels
+        old_level = calculate_level_from_xp(user_data['xp'])
+        new_xp = user_data['xp'] + xp_gained
+        new_level = calculate_level_from_xp(new_xp)
+        
+        # Update user XP in database
+        db.update_user_xp(
+            message.author.id, 
+            message.guild.id, 
+            xp_gained, 
+            new_level if new_level != old_level else None
+        )
+        
+        # Check for level up
+        if new_level > old_level:
+            await announce_level_up(message.author, old_level, new_level, new_xp)
+            
+    except Exception as e:
+        logger.error(f"Error processing XP gain: {e}")
+
+async def announce_level_up(user, old_level, new_level, total_xp):
+    """Announce user level up in the level-up channel"""
+    global levelup_channel
+    
+    if not levelup_channel:
+        return
+    
+    try:
+        # Create level-up embed
+        embed = discord.Embed(
+            title="🎉 Level Up!",
+            description=f"Congratulations {user.mention}! You've reached a new level!",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="Previous Level", value=f"**{old_level}**", inline=True)
+        embed.add_field(name="New Level", value=f"**{new_level}**", inline=True)
+        embed.add_field(name="Total XP", value=f"**{total_xp:,}**", inline=True)
+        
+        # Calculate XP needed for next level
+        xp_for_next = calculate_xp_for_next_level(total_xp)
+        embed.add_field(name="XP to Next Level", value=f"**{xp_for_next:,}**", inline=True)
+        
+        # Get user's rank
+        rank = db.get_user_rank(user.id, user.guild.id)
+        if rank:
+            embed.add_field(name="Server Rank", value=f"**#{rank}**", inline=True)
+        
+        embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
+        embed.set_footer(text=f"Keep chatting to earn more XP!")
+        
+        # Add level milestone messages
+        milestone_messages = {
+            5: "🌟 Welcome to the community!",
+            10: "💫 You're getting active!",
+            25: "⭐ Regular member status!",
+            50: "🔥 Super active member!",
+            100: "👑 Community legend!"
+        }
+        
+        if new_level in milestone_messages:
+            embed.add_field(name="Milestone Reached!", value=milestone_messages[new_level], inline=False)
+        
+        await levelup_channel.send(embed=embed)
+        logger.info(f"Level up announced: {user} reached level {new_level}")
+        
+    except Exception as e:
+        logger.error(f"Error announcing level up: {e}")
+
 async def log_user_message(message):
     """Log user message to the message logging channel"""
     global message_log_channel
@@ -314,6 +480,9 @@ async def on_ready():
     # Set up member count channel
     await setup_member_count_channel()
     
+    # Set up level-up channel
+    await setup_levelup_channel()
+    
     # Set bot status
     activity = discord.Activity(type=discord.ActivityType.watching, name="the server | !help")
     await bot.change_presence(activity=activity)
@@ -390,6 +559,9 @@ async def on_message(message):
     
     # Log all user messages to dedicated channel
     await log_user_message(message)
+    
+    # Process XP gain for leveling system
+    await process_xp_gain(message)
     
     # Update user activity
     try:
@@ -526,6 +698,13 @@ async def send_help_message(channel, user=None):
             value="`!kick <user> [reason]` - Kick a member\n`!ban <user> [reason]` - Ban a member\n`!unban <user_id>` - Unban a member\n`!mute <user> [time] [reason]` - Mute a member\n`!unmute <user>` - Unmute a member\n`!purge <amount>` - Delete messages\n`!testlog` - Test Discord logging\n`!testmessagelog` - Test message logging",
             inline=False
         )
+    
+    # Leveling Commands
+    embed.add_field(
+        name="📊 Leveling System",
+        value="`!level [user]` - Check level and XP\n`!leaderboard [page]` - View server rankings\n`!levelstats` - Server level statistics",
+        inline=False
+    )
     
     # Dev Commands
     embed.add_field(
@@ -939,6 +1118,144 @@ async def show_resources(ctx):
     except Exception as e:
         logger.error(f"Error fetching resources: {e}")
         await ctx.send("An error occurred while fetching resources.")
+
+# Leveling System Commands
+@bot.command(name='level')
+async def check_level(ctx, member: discord.Member = None):
+    """Check user's level and XP"""
+    target_user = member or ctx.author
+    
+    try:
+        user_data = db.get_user_level_data(target_user.id, ctx.guild.id)
+        current_level = calculate_level_from_xp(user_data['xp'])
+        xp_for_next = calculate_xp_for_next_level(user_data['xp'])
+        rank = db.get_user_rank(target_user.id, ctx.guild.id)
+        
+        embed = discord.Embed(
+            title=f"📊 Level Information",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.set_author(
+            name=f"{target_user.display_name}",
+            icon_url=target_user.avatar.url if target_user.avatar else target_user.default_avatar.url
+        )
+        
+        embed.add_field(name="Current Level", value=f"**{current_level}**", inline=True)
+        embed.add_field(name="Total XP", value=f"**{user_data['xp']:,}**", inline=True)
+        embed.add_field(name="Server Rank", value=f"**#{rank}**" if rank else "Unranked", inline=True)
+        
+        embed.add_field(name="XP to Next Level", value=f"**{xp_for_next:,}**", inline=True)
+        embed.add_field(name="Messages Sent", value=f"**{user_data['message_count']:,}**", inline=True)
+        
+        # Calculate progress bar for next level
+        if current_level > 0:
+            current_level_xp = calculate_xp_for_level(current_level)
+            next_level_xp = calculate_xp_for_level(current_level + 1)
+            progress = (user_data['xp'] - current_level_xp) / (next_level_xp - current_level_xp)
+        else:
+            progress = user_data['xp'] / LEVEL_UP_BASE
+        
+        progress_bar = "▰" * int(progress * 10) + "▱" * (10 - int(progress * 10))
+        embed.add_field(name="Progress to Next Level", value=f"`{progress_bar}` {progress*100:.1f}%", inline=False)
+        
+        embed.set_footer(text=f"Keep chatting to earn more XP!")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error checking level: {e}")
+        await ctx.send("An error occurred while checking level information.")
+
+@bot.command(name='leaderboard', aliases=['lb', 'top'])
+async def leaderboard(ctx, page: int = 1):
+    """Show server leaderboard"""
+    try:
+        page = max(1, page)  # Ensure page is at least 1
+        per_page = 10
+        skip = (page - 1) * per_page
+        
+        # Get leaderboard data
+        leaderboard_data = db.get_leaderboard(ctx.guild.id, limit=per_page + skip, sort_by='xp')
+        
+        if not leaderboard_data:
+            await ctx.send("No level data found for this server.")
+            return
+        
+        # Get the slice for current page
+        page_data = leaderboard_data[skip:skip + per_page]
+        
+        embed = discord.Embed(
+            title=f"🏆 Server Leaderboard - Page {page}",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        leaderboard_text = ""
+        for i, user_data in enumerate(page_data, start=skip + 1):
+            try:
+                user = bot.get_user(user_data['user_id'])
+                username = user.display_name if user else f"User {user_data['user_id']}"
+                level = calculate_level_from_xp(user_data['xp'])
+                
+                # Add rank emoji for top 3
+                rank_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**{i}.**")
+                
+                leaderboard_text += f"{rank_emoji} {username}\n"
+                leaderboard_text += f"   Level {level} • {user_data['xp']:,} XP • {user_data['message_count']:,} messages\n\n"
+                
+            except Exception as e:
+                logger.error(f"Error processing leaderboard entry: {e}")
+                continue
+        
+        if leaderboard_text:
+            embed.description = leaderboard_text
+        else:
+            embed.description = "No users found for this page."
+        
+        # Add navigation info
+        total_users = len(leaderboard_data)
+        total_pages = math.ceil(total_users / per_page)
+        embed.set_footer(text=f"Page {page} of {total_pages} • {total_users} total users")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error showing leaderboard: {e}")
+        await ctx.send("An error occurred while fetching the leaderboard.")
+
+@bot.command(name='levelstats')
+async def level_stats(ctx):
+    """Show server-wide level statistics"""
+    try:
+        stats = db.get_level_stats(ctx.guild.id)
+        
+        if not stats:
+            await ctx.send("No level statistics available for this server.")
+            return
+        
+        embed = discord.Embed(
+            title="📈 Server Level Statistics",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(name="Total Active Users", value=f"**{stats['total_users']:,}**", inline=True)
+        embed.add_field(name="Total Messages", value=f"**{stats['total_messages']:,}**", inline=True)
+        embed.add_field(name="Total XP Earned", value=f"**{stats['total_xp']:,}**", inline=True)
+        
+        embed.add_field(name="Average Level", value=f"**{stats['avg_level']:.1f}**", inline=True)
+        embed.add_field(name="Highest Level", value=f"**{stats['max_level']}**", inline=True)
+        embed.add_field(name="Server Activity", value=f"**{stats['total_messages']/stats['total_users']:.1f}** avg messages/user", inline=True)
+        
+        embed.set_footer(text=f"Statistics for {ctx.guild.name}")
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error showing level stats: {e}")
+        await ctx.send("An error occurred while fetching level statistics.")
 
 # Utility Commands
 @bot.command(name='help')

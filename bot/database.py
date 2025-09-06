@@ -156,6 +156,80 @@ class Database:
         collection = self.get_collection('resources')
         return list(collection.find().sort('timestamp', -1).limit(limit))
     
+    # Leveling System
+    def get_user_level_data(self, user_id, guild_id):
+        """Get user's level data (XP, level, message count)"""
+        collection = self.get_collection('user_levels')
+        user_data = collection.find_one({'user_id': user_id, 'guild_id': guild_id})
+        if not user_data:
+            # Create new user level data
+            user_data = {
+                'user_id': user_id,
+                'guild_id': guild_id,
+                'xp': 0,
+                'level': 0,
+                'message_count': 0,
+                'last_xp_gain': None,
+                'created_at': datetime.utcnow(),
+                'updated_at': datetime.utcnow()
+            }
+            collection.insert_one(user_data)
+        return user_data
+    
+    def update_user_xp(self, user_id, guild_id, xp_gained, new_level=None):
+        """Update user's XP and level"""
+        collection = self.get_collection('user_levels')
+        update_data = {
+            '$inc': {'xp': xp_gained, 'message_count': 1},
+            '$set': {'last_xp_gain': datetime.utcnow(), 'updated_at': datetime.utcnow()}
+        }
+        
+        if new_level is not None:
+            update_data['$set']['level'] = new_level
+        
+        return collection.update_one(
+            {'user_id': user_id, 'guild_id': guild_id},
+            update_data,
+            upsert=True
+        )
+    
+    def get_leaderboard(self, guild_id, limit=10, sort_by='xp'):
+        """Get server leaderboard"""
+        collection = self.get_collection('user_levels')
+        return list(collection.find({'guild_id': guild_id}).sort(sort_by, -1).limit(limit))
+    
+    def get_user_rank(self, user_id, guild_id):
+        """Get user's rank in the server"""
+        collection = self.get_collection('user_levels')
+        user_data = collection.find_one({'user_id': user_id, 'guild_id': guild_id})
+        if not user_data:
+            return None
+        
+        # Count users with higher XP
+        higher_xp_count = collection.count_documents({
+            'guild_id': guild_id,
+            'xp': {'$gt': user_data['xp']}
+        })
+        
+        return higher_xp_count + 1  # +1 because rank is 1-indexed
+    
+    def get_level_stats(self, guild_id):
+        """Get server-wide level statistics"""
+        collection = self.get_collection('user_levels')
+        pipeline = [
+            {'$match': {'guild_id': guild_id}},
+            {'$group': {
+                '_id': None,
+                'total_users': {'$sum': 1},
+                'total_messages': {'$sum': '$message_count'},
+                'total_xp': {'$sum': '$xp'},
+                'avg_level': {'$avg': '$level'},
+                'max_level': {'$max': '$level'}
+            }}
+        ]
+        result = list(collection.aggregate(pipeline))
+        return result[0] if result else None
+    
     def close_connection(self):
         """Close database connection"""
         if self.client:

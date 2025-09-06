@@ -1,4 +1,4 @@
-# Discord Bot with MongoDB Integration 🤖
+# Discord Bot with MongoDB Integration 🤖 
 
 A comprehensive Discord bot built with Python and discord.py, featuring role management, admin utilities, welcome system, and MongoDB data storage. The bot runs in Docker containers for easy deployment and scalability.
 

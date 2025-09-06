@@ -108,6 +108,55 @@ class Database:
             {'$set': {'roles': roles}}
         )
     
+    def store_user_profile(self, user_id, username, guild_id, display_name=None, avatar_url=None, 
+                          banner_url=None, accent_color=None, created_at=None, joined_at=None, 
+                          premium_since=None, nick=None, roles=None, status=None, activity=None,
+                          is_bot=False, is_system=False):
+        """Store comprehensive user profile information"""
+        collection = self.get_collection('users')
+        
+        user_data = {
+            'user_id': user_id,
+            'username': username,
+            'display_name': display_name,
+            'guild_id': guild_id,
+            'avatar_url': avatar_url,
+            'banner_url': banner_url,
+            'accent_color': accent_color,
+            'created_at': created_at,
+            'joined_at': joined_at,
+            'premium_since': premium_since,
+            'nick': nick,
+            'roles': roles or [],
+            'status': status,
+            'activity': activity,
+            'is_bot': is_bot,
+            'is_system': is_system,
+            'last_activity': datetime.utcnow(),
+            'profile_updated': datetime.utcnow()
+        }
+        
+        # Remove None values to keep the document clean
+        user_data = {k: v for k, v in user_data.items() if v is not None}
+        
+        # Use upsert to avoid duplicates
+        return collection.update_one(
+            {'user_id': user_id, 'guild_id': guild_id},
+            {'$set': user_data},
+            upsert=True
+        )
+    
+    def get_users_in_database(self, guild_id):
+        """Get list of user IDs that are already in the database for a guild"""
+        collection = self.get_collection('users')
+        cursor = collection.find({'guild_id': guild_id}, {'user_id': 1})
+        return [doc['user_id'] for doc in cursor]
+    
+    def get_user_profile(self, user_id, guild_id):
+        """Get user profile from database"""
+        collection = self.get_collection('users')
+        return collection.find_one({'user_id': user_id, 'guild_id': guild_id})
+    
     # Bug Reports
     def store_bug_report(self, user_id, username, bug_description, guild_id):
         """Store a bug report"""
@@ -155,80 +204,6 @@ class Database:
         """Get recent resources"""
         collection = self.get_collection('resources')
         return list(collection.find().sort('timestamp', -1).limit(limit))
-    
-    # Leveling System
-    def get_user_level_data(self, user_id, guild_id):
-        """Get user's level data (XP, level, message count)"""
-        collection = self.get_collection('user_levels')
-        user_data = collection.find_one({'user_id': user_id, 'guild_id': guild_id})
-        if not user_data:
-            # Create new user level data
-            user_data = {
-                'user_id': user_id,
-                'guild_id': guild_id,
-                'xp': 0,
-                'level': 0,
-                'message_count': 0,
-                'last_xp_gain': None,
-                'created_at': datetime.utcnow(),
-                'updated_at': datetime.utcnow()
-            }
-            collection.insert_one(user_data)
-        return user_data
-    
-    def update_user_xp(self, user_id, guild_id, xp_gained, new_level=None):
-        """Update user's XP and level"""
-        collection = self.get_collection('user_levels')
-        update_data = {
-            '$inc': {'xp': xp_gained, 'message_count': 1},
-            '$set': {'last_xp_gain': datetime.utcnow(), 'updated_at': datetime.utcnow()}
-        }
-        
-        if new_level is not None:
-            update_data['$set']['level'] = new_level
-        
-        return collection.update_one(
-            {'user_id': user_id, 'guild_id': guild_id},
-            update_data,
-            upsert=True
-        )
-    
-    def get_leaderboard(self, guild_id, limit=10, sort_by='xp'):
-        """Get server leaderboard"""
-        collection = self.get_collection('user_levels')
-        return list(collection.find({'guild_id': guild_id}).sort(sort_by, -1).limit(limit))
-    
-    def get_user_rank(self, user_id, guild_id):
-        """Get user's rank in the server"""
-        collection = self.get_collection('user_levels')
-        user_data = collection.find_one({'user_id': user_id, 'guild_id': guild_id})
-        if not user_data:
-            return None
-        
-        # Count users with higher XP
-        higher_xp_count = collection.count_documents({
-            'guild_id': guild_id,
-            'xp': {'$gt': user_data['xp']}
-        })
-        
-        return higher_xp_count + 1  # +1 because rank is 1-indexed
-    
-    def get_level_stats(self, guild_id):
-        """Get server-wide level statistics"""
-        collection = self.get_collection('user_levels')
-        pipeline = [
-            {'$match': {'guild_id': guild_id}},
-            {'$group': {
-                '_id': None,
-                'total_users': {'$sum': 1},
-                'total_messages': {'$sum': '$message_count'},
-                'total_xp': {'$sum': '$xp'},
-                'avg_level': {'$avg': '$level'},
-                'max_level': {'$max': '$level'}
-            }}
-        ]
-        result = list(collection.aggregate(pipeline))
-        return result[0] if result else None
     
     def close_connection(self):
         """Close database connection"""

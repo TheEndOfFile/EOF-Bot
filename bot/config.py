@@ -17,7 +17,6 @@ RULES_CHANNEL = os.getenv('RULES_CHANNEL', 'rules')
 LOG_CHANNEL = os.getenv('LOG_CHANNEL', 'bot-logs')
 MESSAGE_LOG_CHANNEL = os.getenv('MESSAGE_LOG_CHANNEL', 'all-message-logs')
 MEMBER_COUNT_CHANNEL = os.getenv('MEMBER_COUNT_CHANNEL', 'members')
-LEVELUP_CHANNEL = os.getenv('LEVELUP_CHANNEL', 'level-ups')
 
 # Bot Settings
 COMMAND_PREFIX = '!'
@@ -43,16 +42,7 @@ ADMIN_ROLES = ['Admin', 'Moderator']
 LOGGING_LEVEL = os.getenv('LOGGING_LEVEL', 'INFO')
 ADMIN_CATEGORY = os.getenv('ADMIN_CATEGORY', 'Admin')
 GENERAL_CATEGORY = os.getenv('GENERAL_CATEGORY', 'General')
-LEVEL_CATEGORY = os.getenv('LEVEL_CATEGORY', 'Level')
 
 # Discord logging settings
 ENABLE_DISCORD_LOGGING = os.getenv('ENABLE_DISCORD_LOGGING', 'true').lower() == 'true'
 LOG_LEVELS_TO_DISCORD = ['ERROR', 'WARNING', 'INFO']  # Log levels to send to Discord
-
-# Leveling System Configuration
-XP_PER_MESSAGE = int(os.getenv('XP_PER_MESSAGE', '15'))  # Base XP per message
-XP_BONUS_MIN = int(os.getenv('XP_BONUS_MIN', '5'))      # Minimum bonus XP
-XP_BONUS_MAX = int(os.getenv('XP_BONUS_MAX', '25'))     # Maximum bonus XP
-XP_COOLDOWN = int(os.getenv('XP_COOLDOWN', '0'))       # Cooldown between XP gains (seconds)
-LEVEL_UP_BASE = int(os.getenv('LEVEL_UP_BASE', '100'))  # Base XP needed for level 1
-LEVEL_UP_MULTIPLIER = float(os.getenv('LEVEL_UP_MULTIPLIER', '1.5'))  # XP multiplier per level
